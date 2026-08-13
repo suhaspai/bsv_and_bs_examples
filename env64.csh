@@ -10,20 +10,23 @@ setenv BSV $PWD
 #-----------------------------------------------------------------
 # Aliases
 #-----------------------------------------------------------------
-alias chex                                \
-    'setenv tb  \!:1;                     \
-    setenv bsv $BSV/$tb;                  \
-    setenv rtl $BSV/$tb/down/rtl          \
-    setenv src $BSV/$tb/down/src          \
-    setenv sv  $BSV/$tb/down/sv           \
+alias chex                              \
+    'setenv tb  \!:1;                   \
+    setenv bsv $BSV/$tb;                \
+    setenv bs  $bsv                     \
+    setenv rtl $BSV/$tb/rtl             \
+    setenv src $BSV/$tb/src             \
+    setenv sv  $BSV/$tb/sv              \
+    setenv bldex $scr/$tb               \
     setenv v_dir $scr/$tb/src           \
+    setenv bo_dir $scr/$tb/biboba       \
     setenv i_dir $scr/$tb/info          \
     setenv vcs_dir $scr/$tb/vcs         \
     setenv bsim_dir $scr/$tb/bsim       \
     setenv mti_dir $scr/$tb/mti         \
     setenv novas_dir $scr/$tb/novas     \
-    setenv CVSROOT $HOME/cvsroot  \
-    cd $bsv                               '
+    setenv CVSROOT $HOME/cvsroot        \
+    cd $bsv                             '
 
 # src is C++ testbench source and not compiled verilog code (all eve_scemi_* examples have this directory)
 alias bsv 'cd $bsv'
