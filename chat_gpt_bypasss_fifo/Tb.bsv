@@ -54,20 +54,20 @@ module mkTb(Empty);
       fifo.enq(8'h09); // Bypass occurs here
 
       if (fifo.first() != 8'h03) 
-         $display("Test Case 2 Failed: Expected 0x03 at time= ", $time);
+         $display("Test Case 2 Failed: Expected 0x03 Found= 0x%08x at time= ", fifo.first(), $time);
       else
          $display("Test Case 2 Passed: Expected 0x03 at time= ", $time);            
       fifo.deq();
 
       if (fifo.first() != 8'h04) 
-         $display("Test Case 2 Failed: Expected 0x04 at time= ", $time);
+         $display("Test Case 2 Failed: Expected 0x04 Found= 0x%08x at time= ", fifo.first(), $time);
       else
          $display("Test Case 2 Passed: Expected 0x04 at time= ", $time);
       fifo.deq();
 
       // Check bypassed value
       if (fifo.first() != 8'h09) 
-         $display("Test Case 2 Failed: Expected 0x09 at time= ", $time); 
+         $display("Test Case 2 Failed: Expected 0x09 Found= 0x%08x at time= ", fifo.first(), $time);
       else
          $display("Test Case 2 Passed: Expected 0x09 at time= ", $time);
 

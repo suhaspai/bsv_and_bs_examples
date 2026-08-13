@@ -10,7 +10,11 @@ PSEARCH ?= :+
 MAINV   ?= ${BLUESPECDIR}/Verilog/main.v
 
 # Default target
-build: synth
+bluesim: synth_bluesim run_bsim
+rtlsim: icarus_sim
+
+icarus_sim: synth_icarus run_icarus
+verilator_sim: link_verilator run_verilator
 
 # Makefile for small examples
 bsv_files= ${sim_top} ${sim_rest}
@@ -45,23 +49,23 @@ mkTb     = ${sim_top:%.bsv=mk%}
 # Transformation Rules
 mk%V: %.bsv
 	mkdir -p ${v_dir} ${bo_dir} ${i_dir}
-	/usr/bin/time bsc -u -verilog -elab ${special_compile_flags} \
+	/usr/bin/time bsc -u -verilog -elab  \
 	-bdir ${bo_dir} -vdir ${v_dir} -info-dir ${i_dir} -p ${PSEARCH} -no-show-method-conf \
-	${BSV_COMP_OPTS} \
+	${bsv_compile_flags} \
 	-show-schedule -show-compiles -aggressive-conditions -keep-fires -no-inline-rwire   \
 	-remove-dollar -show-range-conflict ${link_type} $< |& tee ${v_dir}/synthesis.txt
 
 mk%BA: %.bsv
 	@mkdir -p ${s_dir} ${bo_dir} ${i_dir}
-	/usr/bin/time bsc -u -sim -info-dir ${i_dir} \
-	-bdir ${bo_dir} -p ${PSEARCH} ${special_compile_flags} \
+	/usr/bin/time bsc -u -g ${mkTb} -sim -info-dir ${i_dir} \
+	-bdir ${bo_dir} -p ${PSEARCH} ${bsv_compile_flags} \
 	-show-schedule -show-compiles -aggressive-conditions -keep-fires -no-inline-rwire   \
 	-show-range-conflict ${link_type} $<  |& tee ${s_dir}/bluesim.txt
 
 #--------------------------- verilator via bsc ----------------------------
-link_verilator: ${v_dir}/mkTb.v
+link_verilator: ${v_dir}/${mkTb}.v
 	mkdir -p ${verilator_dir}
-	cd ${verilator_dir} && bsc ${special_compile_flags} -e mkTb \
+	cd ${verilator_dir} && bsc ${rtl_compile_flags} -e mkTb \
 	-o out.verilator -vdir ${v_dir} -vsim verilator -keep-fires $< |& tee link_verilator.txt
 run_verilator:
 	cd ${verilator_dir} && out.verilator
@@ -74,8 +78,8 @@ link_xsim: ${xsim_dir}/out.vsim
 ${xsim_dir}/out.vsim: 
 	@echo Linking with xsim
 	mkdir -p ${xsim_dir}
-	cd ${xsim_dir} && bsc ${special_compile_flags} -e mkTb -verilog -Xv --timescale=1ns/1ps \
-	-o out.vsim -vdir ${v_dir} -vsim xsim -keep-fires ${v_dir}/mkTb.v |& tee link_xsim.txt
+	cd ${xsim_dir} && bsc ${rtl_compile_flags} -e ${mkTb} -verilog -Xv --timescale=1ns/1ps \
+	-o out.vsim -vdir ${v_dir} -vsim xsim -keep-fires ${v_dir}/${mkTb}.v |& tee link_xsim.txt
 
 # xsim -h
 run_xsim: 
@@ -88,11 +92,11 @@ clean_link_xsim:
 	rm -rf ${xsim_dir}
 
 #---------------------------  isim --------------------------------
-link_isim: ${v_dir}/mkTb.v
+link_isim: ${v_dir}/${mkTb}.v
 	@echo Linking with isim
 	mkdir -p ${isim_dir}
-	cd ${isim_dir} && bsc ${special_compile_flags} -e mkTb -verilog \
-	-o ${isim_dir}/out.vsim -vdir ${v_dir} -vsim isim -keep-fires ${v_dir}/mkTb.v 
+	cd ${isim_dir} && bsc ${rtl_compile_flags} -e ${mkTb} -verilog \
+	-o ${isim_dir}/out.vsim -vdir ${v_dir} -vsim isim -keep-fires ${v_dir}/${mkTb}.v 
 
 run_isim: ${isim_dir}/out.vsim
 	cd ${isim_dir} && ${isim_dir}/out.vsim.isim -testplusarg bscvcd -testplusarg bsccycle \
@@ -115,9 +119,10 @@ ${s_dir}/%.o: %.cxx
 	${COMPILE.cpp} ${OUTPUT_OPTION} -fPIC $<
 
 #------------------------ iverilog simulator ----------------------
+synth_icarus: ${icarus_dir}/${mkTb}
 ${icarus_dir}/${mkTb}: synth
 	mkdir -p ${icarus_dir}
-	iverilog -Wall -y . -y ${BLUESPECDIR}/Verilog ${BLUESPECDIR}/Verilog/main.v \
+	iverilog -Wall -y . -y ${BLUESPECDIR}/Verilog ${BLUESPECDIR}/Verilog/main.v ${rtl_compile_flags} \
 	-y ${v_dir}  -DTOP=${mkTb} -o $@
 
 .PHONY: run_icarus
@@ -130,24 +135,25 @@ ${bsim_dir}/scemi_done:
 	touch $@
 
 # bluesim link target
+synth_bluesim: ${bsim_dir}/${mkTb}.out
 ifneq (${LINK_TYPE},)
-${bsim_dir}/bsim: ${ba_rules} 
+${bsim_dir}/${mkTb}.out: ${ba_rules} 
 	mkdir -p ${bsim_dir} ${s_dir}
 	cd ${bsim_dir} && \
-	/usr/bin/time -f "Time=%E" bsc -sim -scemi -e ${mkTb} -bdir ${bo_dir} ${special_compile_flags} \
+	/usr/bin/time -f "Time=%E" bsc -sim -scemi -e ${mkTb} -bdir ${bo_dir} ${rtl_compile_flags} \
 	-simdir ${s_dir} -o $@  |& tee -a bluesim.txt
 else
-${bsim_dir}/bsim: ${ba_rules} ${cxx_obj}
+${bsim_dir}/${mkTb}.out: ${ba_rules} ${cxx_obj}
 	mkdir -p ${bsim_dir} ${s_dir}
 	cd ${bsim_dir} && \
-	/usr/bin/time -f "Time=%E" bsc -sim -e ${mkTb} -bdir ${bo_dir} ${special_compile_flags} \
-	-simdir ${s_dir} -o ${bsim_dir}/out.bsim  ${bo_dir}/*.ba ${cxx_obj} |& tee -a bluesim.txt
+	/usr/bin/time -f "Time=%E" bsc -sim -e ${mkTb} -bdir ${bo_dir} ${rtl_compile_flags} \
+	-simdir ${s_dir} -o $@  ${bo_dir}/*.ba ${cxx_obj} |& tee -a bluesim.txt
 endif
 
 # Dependency on ${bsim_dir}/bsim is removed. make 'bsim' before 'run_bsim'
 .PHONY: run_bsim run_sim run_sim1
-run_bsim: 
-	cd ${bsim_dir} && ./out.bsim +bsccycle -V ${mkTb}.vcd 
+run_bsim: ${bsim_dir}/${mkTb}.out
+	cd ${bsim_dir} && ./${mkTb}.out +bsccycle -V ${mkTb}.vcd 
 
 # Pick bluesim as the default simulator
 run_sim: ${bsim_dir}/bsim
@@ -160,7 +166,7 @@ run_sim1: run_bsim
 # VCS simulator
 ${vcs_dir}/simv: synth
 	mkdir -p ${vcs_dir}
-	cd ${vcs_dir} && vcs -debug_pp -full64 +v2k +libext+.v ${MAINV} \
+	cd ${vcs_dir} && vcs -debug_pp -full64 +v2k +libext+.v ${rtl_compile_flags} ${MAINV} \
 	+define+BSC_FSDB +define+TOP=${mkTb} \
 	-y ${v_dir} -y ${BLUESPECDIR}/Verilog -y . \
 	-P ${VERDI_HOME}/share/PLI/VCS/SUSE64/novas.tab ${VERDI_HOME}/share/PLI/VCS/SUSE64/pli.a \
@@ -182,7 +188,7 @@ ${mti_dir}/simu.work:
 	cd ${mti_dir} && vlib simu.work && vmap work ${mti_dir}/simu.work
 
 ${mti_dir}/mti: synth ${mti_dir}/simu.work
-	cd ${mti_dir} && vlog -work simu.work +define+TOP=${mkTb} +v2k ${MAINV} \
+	cd ${mti_dir} && vlog -work simu.work ${rtl_compile_flags} +define+TOP=${mkTb} +v2k ${MAINV} \
 		-y ${BLUESPECDIR}/Verilog -y ${v_dir}  +libext+.v 
 	cd ${mti_dir} && touch mti
 
@@ -197,11 +203,11 @@ view_mti: ${mti_dir}/dump.fsdb ${novas_dir}/nov
 
 .PHONY: vpp
 # verilog pre-processed
-v_top ?= ${v_dir}/mkTb.v
+v_top ?= ${v_dir}/${mkTb}.v
 y_dir ?= -y ${BLUESPECDIR}/Verilog -y ${BLUESPECDIR}/Libraries -y ${v_dir} 
 vpp: ${v_top}
 	cd ${v_dir} && rm -rf work && vlib work 
-	cd ${v_dir} && vlog +v2k +libext+.v ${y_dir} $< -E vpp.v
+	cd ${v_dir} && vlog +v2k +libext+.v ${rtl_compile_flags} ${y_dir} $< -E vpp.v
 
 
 .PHONY: compile_novas
@@ -210,7 +216,7 @@ compile_novas: ${novas_dir}/nov
 
 ${novas_dir}/nov: 
 	mkdir -p ${novas_dir}
-	cd ${novas_dir} && vericom -2001 -lib simu.work +libext+.v +define+BSC_FSDB +define+TOP=${mkTb} \
+	cd ${novas_dir} && vericom -2001 -lib simu.work +libext+.v ${rtl_compile_flags} +define+BSC_FSDB +define+TOP=${mkTb} \
 	-y ${BLUESPECDIR}/Verilog -y ${v_dir} ${MAINV}
 	touch $@
 
@@ -254,7 +260,7 @@ mti_waves:
 	bluespec tb.bspec &
 
 view_sim: run_sim
-	gtkwave -f ${bsim_dir}/mkTb.vcd &
+	gtkwave -f ${bsim_dir}/${mkTb}.vcd &
 
 waven waves:
 	rm -f ${mti_dir}/bluespec_init.tcl
@@ -316,7 +322,6 @@ doc: doc_bsv doc_rtl
 .PHONY: clean_doc
 clean_doc:
 	rm -rf ${rtl_doc} ${bsv_doc}
-
 help:
 	@echo
 	@echo "   TARGETS:"
@@ -330,7 +335,7 @@ help:
 	@echo "     run_mti - runs modelsim simulation"
 	@echo "    view_mti - view fsdb waveform in Verdi"
 	@echo
-	@echo "      icarus - creates iverilog executable ${icarus_dir}/{mkTb}"
+	@echo "      icarus - creates iverilog executable ${icarus_dir}/${mkTb}"
 	@echo "  run_icarus - runs iverilog simulation"
 	@echo
 	@echo "        simv - Creates Vcs executable- ${vcs_dir}/simv"
@@ -356,7 +361,6 @@ env:
 	@echo "     .ba file directory: ${s_dir}"
 	@echo ".bi, .bo file directory: ${bo_dir}"
 	@echo "---------------------------------------------------------"
-	@echo "              BSV files: ${bsv_files}"
 	@echo "              CXX files: ${cxx_files}"
 	@echo "              DUT files: ${dut_files}"
 	@echo "              SYN files: ${syn_files}"
