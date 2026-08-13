@@ -1,0 +1,98 @@
+package Tb where
+
+-- Demonstrates the difference between:
+--   ==   Eq class's logical equality -- Verilog-style: an X bit in
+--        either operand makes the WHOLE result indeterminate (X),
+--        not a definite True/False.
+--   ===  case/strict equality -- always yields a definite True/False,
+--        even when operands contain X/Z. X matches X; X never matches
+--        a defined 0 or 1.
+--
+-- Tests 1-2 use fully-defined values, where == and === must agree.
+-- Tests 3-4 use X (via the `_` unspecified-value literal) to show
+-- where they diverge. Watch the ACTUAL simulator output for tests 3-4
+-- rather than trusting any comment here -- an indeterminate `if`
+-- condition is exactly the kind of thing worth observing empirically
+-- rather than assuming, and Bluesim's specific handling of it is best
+-- confirmed by running this rather than reading about it.
+
+{-# verilog mkTb #-}
+  
+mkTb :: Module Empty
+mkTb =
+  module
+    cyc :: Reg (Bit 8) <- mkReg 0
+
+    rules
+      "run": when True ==> do
+        cyc := cyc + 1
+        case cyc of
+          1 -> do
+            $display "-- Test 1: two matching, fully-defined values --"
+            let a = 5 :: Bit 8
+                b = 5 :: Bit 8
+            $display   " a=%x "  a " b= %x"  b 
+            if a == b
+              then $display "==  : True"
+              else $display "==  : False"
+            if a === b
+              then $display "=== : True" 
+              else $display "=== : False"
+
+          2 -> do
+            $display "-- Test 2: two different, fully-defined values --"
+            let a = 5 :: Bit 8
+                b = 9 :: Bit 8
+            $display   " a=%x "  a " b= %x"  b 
+            if a == b
+              then $display "==  : True"
+              else $display "==  : False"
+            if a === b
+              then $display "=== : True"
+              else $display "=== : False"
+
+          3 -> do
+            $display "-- Test 3: two matching X (unspecified) values --"
+            let a = _ :: Bit 8
+                b = _ :: Bit 8
+            $display   " a=%x "  a " b= %x"  b 
+            if a == b
+              then $display "==  : True"
+              else $display "==  : False  <- watch: is this really False, or is the condition itself X and the simulator just took the else branch?"
+            if a === b
+              then $display "=== : True   <- === treats matching X patterns as equal"
+              else $display "=== : False"
+
+          4 -> do
+            $display "-- Test 4: one X value vs one defined value --"
+            let a = _ :: Bit 8
+                b = 5 :: Bit 8
+            $display   " a=%x "  a " b= %x"  b 
+            if a == b
+              then $display "==  : True"
+              else $display "==  : False  <- again, check whether this is a real False or a resolved-X"
+            if a === b
+              then $display "=== : True"
+              else $display "=== : False  <- === is unambiguous: X never equals a defined bit"
+
+          5 -> $finish 0
+          _ -> return ()
+
+
+{- Output from icarus run:
+-- Test 1: two matching, fully-defined values --
+ a=05  b= 05
+==  : True
+=== : True
+-- Test 2: two different, fully-defined values --
+ a=05  b= 09
+==  : False
+=== : False
+-- Test 3: two matching X (unspecified) values --
+ a=aa  b= aa
+==  : True
+=== : True   <- === treats matching X patterns as equal
+-- Test 4: one X value vs one defined value --
+ a=aa  b= 05
+=== : False  <- === is unambiguous: X never equals a defined bit
+-}
