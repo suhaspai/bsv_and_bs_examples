@@ -1,0 +1,81 @@
+==== Link assumptions ====
+  Gen3 x8 lanes @ 250 MHz  ->  32 bytes/cycle (effective, hand-derived -- see note above)
+  theoretical link throughput: 64000 Mb/s (64.0 Gb/s)
+
+==== Bidirectional PCIe producer-consumer model ====
+ENFORCE_ORDERING=1  total cycles=25684
+---- Side 0 ----
+  Posted sent=2000  Reads sent=0  Reads answered=0  Completions recv'd=0
+  incoming P avg/max latency   : 536 / 574 cycles
+  read-request avg/max latency : 0 / 0 cycles
+  completion avg/max latency   : 0 / 0 cycles
+  NP held by ordering : 0   CPL held by ordering : 0
+  ORDER VIOLATIONS: 0   DATA VIOLATIONS: 0
+  observed link throughput    : 23672.32 Mb/s  (36.9% of theoretical, all TLP types)
+  observed payload throughput : 19934.58 Mb/s  (Posted Writes only, useful data rate)
+---- Side 1 ----
+  Posted sent=2000  Reads sent=0  Reads answered=0  Completions recv'd=0
+  incoming P avg/max latency   : 536 / 574 cycles
+  read-request avg/max latency : 0 / 0 cycles
+  completion avg/max latency   : 0 / 0 cycles
+  NP held by ordering : 0   CPL held by ordering : 0
+  ORDER VIOLATIONS: 0   DATA VIOLATIONS: 0
+  observed link throughput    : 23672.32 Mb/s  (36.9% of theoretical, all TLP types)
+  observed payload throughput : 19934.58 Mb/s  (Posted Writes only, useful data rate)
+
+
+===== Analysis (write after write) =====
+Traffic generation at 250 Mhz
+Cycle Period = 4 ns (1 GHz = 1 ns => 250 Mhz => 0.25 GHz => 4 ns = 4e-9)
+
+Number of bytes with 4 ns period at Gen-3 x8 = (4e-9  * 8 lanes * 8e9 transafers/sec) / (8 bits/byte)  = 32 bytes per 250Mhz cycle (or 4 ns)
+LINK_BYTES_PER_CYCLE = 32  bytes  (ignoring coding loss due to 128/130)
+
+Theoretical link throughput at Gen3 x8 lanes = 8e9 GT/s * 8 lanes = 64 Gb/s (ignoring 128b/130b coding loss)
+Integer theoreticalMbps = `LINK_BYTES_PER_CYCLE * `CLOCK_RATE_MHZ * 8;
+                        = 32 * 250e6 * 8
+                        = 64 Gb/s
+
+Simulation run time = 25684 cycles * 4 ns/cycle  (User clock rate = 250 Mhz)
+Bytes sent across = (Overhead + Payload) * (Number of transactions)
+                  = (24 + 128) * 2000
+                  = 304,000 bytes
+$display("pWireBytes=%0d npWireBytes=%0d cplWireBytes=%0d wireBytesSent=%0d  payloadBytesSent=%0d cycles=%0d", 
+         pWireBytes, npWireBytes, cplWireBytes, wireBytesSent, payloadBytesSent, cycU64);
+pWireBytes=152 npWireBytes=20 cplWireBytes=84 wireBytesSent=324800  payloadBytesSent=256000 cycles=30820
+
+Throughput = Bytes/Run-time = 304,000 bytes * 8 bits/byte / (25,684 * 4e-9) =
+                            = 304,000 * 8 * 10^9/25,684/4/10^6   Mb/s
+                            = 304,000 * 8 * 250/25684
+                            = 23,672.32 Mb/s
+% link utilization          = 23,672.32 / 80,0000 = 36.98%
+
+Applied traffic generation rate = 152 bytes/P-TLP * 250 MHz * 8 bits/byte = 304,000 Mb/s = 304 Gb/s = 38 GB/s
+
+Max link byte throughput = 8 GB/s
+
+Even if the posted write transactions can be pipelined every clock cycle (38 GB/s)  as is evident from
+observing tCreate timestamp in waw.txt, the link utilization is only 36.9%.
+The bottleneck is outQ fifo which has a depth of 8 however the posted write fifo (pQ) has the depth of 32.
+Under current assumptions, the roundtrip link latency is 200 ns for return credit and given that it takes
+5 clock cycles to serialize the transaction at x8 with Gen-3 speed, the outQ fifo depth can be adjusted, for 
+example to 200/5=40. This gives a nice framework to optimizing performance by adjusting fifo sizes.
+Similar exercise can be done for read after write and read after read runs.
+
+Hardcoded fifo depths:
+PcieModelOrdered.bsv:350:   FIFOF#(Tlp) pQ   <- mkSizedFIFOF(32);
+PcieModelOrdered.bsv:351:   FIFOF#(Tlp) npQ  <- mkSizedFIFOF(16);
+PcieModelOrdered.bsv:352:   FIFOF#(Tlp) cplQ <- mkSizedFIFOF(16);
+PcieModelOrdered.bsv:357:   FIFOF#(Tuple2#(TlpKind,Cycle)) credRet <- mkSizedFIFOF(16);
+PcieModelOrdered.bsv:358:   FIFOF#(Tlp) outQ   <- mkSizedFIFOF(8);
+PcieModelOrdered.bsv:359:   FIFOF#(Tlp) inQ_P   <- mkSizedFIFOF(8);
+PcieModelOrdered.bsv:360:   FIFOF#(Tlp) inQ_Np  <- mkSizedFIFOF(8);
+PcieModelOrdered.bsv:361:   FIFOF#(Tlp) inQ_Cpl <- mkSizedFIFOF(8);
+
+
+
+
+
+
+
+

@@ -44,7 +44,7 @@ ba_files = ${bs_files:%.bs=${bo_dir}/mk%.ba}
 ba_rules = ${bs_files:%.bs=mk%BA}
 v_files  = ${bs_files:%.bs=${v_dir}/mk%.v}
 v_rules  = ${bs_files:%.bs=mk%V}
-cxx_obj  = ${cxx_files:%.cxx=${s_dir}/%.o}
+c_obj    = ${c_files:%.c=${s_dir}/%.o}
 mkTb     = ${sim_top:%.bs=mk%}
 
 # Transformation Rules
@@ -114,9 +114,9 @@ vivado:
 	mkdir -p ${vivado_dir}
 	cd ${vivado_dir} && vivado &
 
-${s_dir}/%.o: %.cxx
+${s_dir}/%.o: %.c
 	@mkdir -p ${s_dir}
-	@echo compile C++ code
+	@echo compile C code
 	${COMPILE.cpp} ${OUTPUT_OPTION} -fPIC $<
 
 #------------------------ iverilog simulator ----------------------
@@ -142,27 +142,22 @@ ${bsim_dir}/${mkTb}.out: ${ba_rules}
 	mkdir -p ${bsim_dir} ${s_dir}
 	cd ${bsim_dir} && \
 	/usr/bin/time -f "Time=%E" bsc -sim -scemi -e ${mkTb} -bdir ${bo_dir} ${rtl_compile_flags} \
-	-simdir ${s_dir} -o $@  |& tee -a bluesim.txt
+	-simdir ${s_dir} -o $@ |& tee -a bluesim.txt
 else
-${bsim_dir}/${mkTb}.out: ${ba_rules} ${cxx_obj}
+${bsim_dir}/${mkTb}.out: ${ba_rules} ${c_obj}
 	mkdir -p ${bsim_dir} ${s_dir}
 	cd ${bsim_dir} && \
 	/usr/bin/time -f "Time=%E" bsc -sim -e ${mkTb} -bdir ${bo_dir} ${rtl_compile_flags} \
-	-simdir ${s_dir} -o $@  ${bo_dir}/*.ba ${cxx_obj} |& tee -a bluesim.txt
+	-simdir ${s_dir} -o $@  ${bo_dir}/*.ba ${c_obj} |& tee -a bluesim.txt
 endif
 
 # Dependency on ${bsim_dir}/bsim is removed. make 'bsim' before 'run_bsim'
-.PHONY: run_bsim run_sim run_sim1
-run_bsim: ${bsim_dir}/${mkTb}.out
+.PHONY: run_bsim 
+run_bsim: 
 	cd ${bsim_dir} && ./${mkTb}.out +bsccycle -V ${mkTb}.vcd 
 
 # Pick bluesim as the default simulator
-run_sim: ${bsim_dir}/bsim
-	cd ${bsim_dir} && ./out.bsim +bsccycle -V ${mkTb}.vcd 
-
-run_sim1: run_bsim
-	cp tb.gdb ${bsim_dir}
-	cd ${bsim_dir} && sleep 5 && emacs -l ${rtl}/gdb.el -f load-gdb
+run_sim: run_bsim
 
 # VCS simulator
 ${vcs_dir}/simv: synth
@@ -361,8 +356,9 @@ env:
 	@echo "           .v directory: ${v_dir}"	
 	@echo "     .ba file directory: ${s_dir}"
 	@echo ".bi, .bo file directory: ${bo_dir}"
+	@echo "               ba_rules: ${ba_rules}"
 	@echo "---------------------------------------------------------"
-	@echo "              CXX files: ${cxx_files}"
+	@echo "            .c/.o files: ${c_files} ${c_obj}"
 	@echo "              DUT files: ${dut_files}"
 	@echo "              SYN files: ${syn_files}"
 	@echo "              SIM files: ${sim_files}"

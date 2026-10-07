@@ -1,0 +1,658 @@
+package PcieModelOrdered (mkPcieModelOrdered) where
+
+-- PcieModelOrdered.bs -- classic Bluespec Haskell (BH) syntax translation
+-- of PcieModelOrdered.bsv. Same bidirectional producer-consumer model:
+-- two symmetric Sides, each a producer (Posted Writes), requester
+-- (Non-Posted reads) and responder (Completions generated causally from
+-- delivered reads), connected by two propagation-delay pipes.
+--
+-- Each write carries a real payload: addr (its own sequence number mod
+-- BufSize, a small circular buffer) and dat (its own sequence number --
+-- a pattern either side can recompute independently). Each read targets
+-- a specific earlier write (readGapI writes back) and the returned value
+-- is checked arithmetically against pack(seqNum), never via a lookup into
+-- mutable state (an earlier shadow-memory design was provably wrong: by
+-- the time a slow completion returns, that memory may already reflect
+-- later writes reusing the same address -- see the .bsv version's commit
+-- history / conversation for the traced bug).
+--
+-- Traffic patterns, set via environment variables at RUN time (no
+-- recompile needed -- see CONFIGURATION below):
+--   all writes        -> NUM_NP_A=0 NUM_NP_B=0
+--   all reads         -> NUM_P_A=0 NUM_P_B=0 READ_GAP=0
+--   read-after-write  -> default (every read targets a real earlier write)
+--   max throughput    -> NUM_NP_A/NUM_NP_B raised to match NUM_P_A/NUM_P_B,
+--                        and PROD_NP_INTERVAL=1 (reads issued every cycle,
+--                        same rate as writes); needs the per-kind inbound
+--                        queue split below to avoid a real deadlock.
+--
+-- Build & run:
+--   bsc -sim -u -g mkPcieModelOrdered PcieModelOrdered.bs BdpiConfig.bsv
+--   bsc -sim -e mkPcieModelOrdered -o pcie_bh bdpi_glue.c
+--   ./pcie_bh                                 -- all defaults
+--   NUM_NP_A=2000 PROD_NP_INTERVAL=1 ./pcie_bh -- max throughput, same binary
+--
+-- CONFIGURATION: classic syntax has no `define/`ifndef (backtick is
+-- reserved for infix application, e.g. `div`), so there is no -D
+-- mechanism here -- that limitation was real and is now worked around,
+-- not just documented. Runtime-tunable parameters (traffic counts,
+-- intervals, READ_GAP, ENFORCE_ORDERING) live in a Config struct with a
+-- defaultConfig value (BdpiConfig.bsv), optionally overridden per-field
+-- by an environment variable of the same name, read ONCE at simulation
+-- start via BDPI and latched into registers -- one compiled binary,
+-- runtime-configurable, which is arguably better than -D ever was.
+--
+-- This does NOT extend to structural parameters (FIFO depths, Vector
+-- sizes, credit-pool depths, byte sizes, below): BDPI calls only execute
+-- inside rules, at simulation runtime, strictly after Bluespec's static
+-- elaboration -- which is what decides FIFO depths and Vector dimensions
+-- -- has already finished building the module tree. Those stay fixed
+-- Integer constants; there is no way around that with BDPI or anything
+-- else short of actual reconfigurable hardware.
+--
+-- BdpiConfig.bsv is the only file in this project using BSV syntax: the
+-- clean, name-based `import "BDPI"` form needed for an environment-
+-- variable reader does not parse in a .bs file at all, and classic
+-- syntax's own `foreign` keyword only accepts raw Bit#(n) arguments (no
+-- String) -- confirmed by trying both. Isolating that one FFI boundary in
+-- its own file avoids any foreign-syntax leakage into the classic-syntax
+-- side; mkConfigReader is called here exactly like any other module.
+
+import FIFOF
+import Vector
+import BdpiConfig
+
+-- ----------------------------------------------------------------------
+-- Parameters
+--
+-- Classic syntax does not support the `define/`ifndef preprocessor
+-- directives used throughout the .bsv version (backtick is reserved for
+-- infix function application, e.g. `div`), so these are plain top-level
+-- constants instead of command-line-overridable macros.
+-- ----------------------------------------------------------------------
+-- numPA, numNPA, numPB, numNPB, prodPIntervalI, prodNPIntervalI, readGapI
+-- and enforceOrdering used to live here as plain Integer/Bool constants.
+-- They are now fields of defaultConfig (BdpiConfig.bsv) instead -- same
+-- values, single source of truth, and each one individually overridable
+-- by an environment variable at run time without recompiling.
+
+pPayloadBytes :: Integer
+pPayloadBytes = 128
+pOverheadBytes :: Integer
+pOverheadBytes = 24
+npHeaderBytes :: Integer
+npHeaderBytes = 20
+
+cplPayloadBytes :: Integer
+cplPayloadBytes = 64
+cplOverheadBytes :: Integer
+cplOverheadBytes = 20
+
+linkBytesPerCycle :: Integer
+linkBytesPerCycle = 32
+linkLatencyI :: Integer
+linkLatencyI = 100
+
+-- Link assumptions, printed for context -- display only, not independently
+-- driving anything: linkBytesPerCycle above is the one parameter that
+-- actually sets simulated serialization timing, hand-derived from a Gen3
+-- x8 @ 250 MHz link (128b/130b encoding, ~7.88 GB/s effective, rounded to
+-- 32 B/cycle -- see this conversation's very first turns). Changing
+-- pcieGen/numLanes here relabels the printed assumptions; it does not
+-- recompute linkBytesPerCycle for you.
+pcieGen :: String
+pcieGen = "Gen3"
+numLanes :: Integer
+numLanes = 8
+clockRateMHz :: Integer
+clockRateMHz = 250
+
+-- Integer fixed-point, not Real: Real's fromInteger only accepts a
+-- compile-time Integer, never a runtime register value (confirmed
+-- directly against both syntaxes -- a plain UInt 64 register fails to
+-- type-check through fromInteger), so Real can only ever help with this
+-- theoretical, compile-time-constant side of a throughput calculation,
+-- never the observed side, which needs cyc and byte counts at runtime.
+theoreticalMbps :: Integer
+theoreticalMbps = linkBytesPerCycle * clockRateMHz * 8
+
+creditsPI :: Integer
+creditsPI = 16
+creditsNPI :: Integer
+creditsNPI = 8
+creditsCplI :: Integer
+creditsCplI = 8
+
+type Cycle = UInt 32
+
+-- BufBits/BufSize: a small circular buffer each side's writes land in.
+-- addr is (sequence number mod BufSize); data is the sequence number
+-- itself -- a pattern either side can recompute independently, which is
+-- what makes the data-integrity check meaningful rather than circular.
+type BufBits = 5
+type BufSize = 32
+
+data TlpKind = TPOSTED | TNONPOSTED | TCOMPLETION
+  deriving (Bits, Eq)
+
+struct Tlp =
+    kind     :: TlpKind
+    depCount :: Cycle       -- TX-ordering gate value (see .bsv comments)
+    seqNum   :: Cycle       -- NP: target write's sequence number. CPL:
+                            -- echoed through unchanged. P: this write's own.
+    addr     :: Bit BufBits -- = seqNum mod BufSize
+    dat      :: Bit 32      -- P: value written (=pack seqNum). CPL: value
+                            -- actually found at addr by the responder.
+    tCreate  :: Cycle
+ deriving (Bits, Eq)
+
+-- ----------------------------------------------------------------------
+-- One credit pool per TLP type
+-- ----------------------------------------------------------------------
+interface CreditPool =
+    avail :: Bool
+    take  :: Action
+    give  :: Action
+
+mkCreditPool :: Integer -> Module CreditPool
+mkCreditPool n =
+  module
+    credits :: Reg (UInt 16)
+    credits <- mkReg (fromInteger n)
+    takePw :: PulseWire
+    takePw <- mkPulseWire
+    givePw :: PulseWire
+    givePw <- mkPulseWire
+
+    rules
+      {-# ASSERT fire when enabled #-}
+      {-# ASSERT no implicit conditions #-}
+      when True ==>
+        action
+          if takePw && not givePw
+           then credits := credits - 1
+           else
+            if not takePw && givePw
+             then credits := credits + 1
+             else noAction
+
+    interface
+      avail = credits /= 0
+      take = takePw.send
+      give = givePw.send
+
+-- ----------------------------------------------------------------------
+-- One side: producer + requester + responder
+--
+-- Inbound is split one-FIFO-per-TLP-kind, not a single shared queue. With
+-- a single inbound FIFO, a completion stuck behind a full cplQ (itself
+-- stuck behind a starved pSentCount) head-of-line-blocks every OTHER kind
+-- behind it too, including the very Posted Writes that would un-stick it
+-- -- a genuine circular deadlock, confirmed by tracing a real run (see
+-- the .bsv version and conversation). Separate per-kind receive queues
+-- are exactly why real PCIe keeps separate buffers per TLP type.
+-- ----------------------------------------------------------------------
+interface Side =
+    wireOut   :: FIFOF Tlp
+    wireInP   :: FIFOF Tlp
+    wireInNp  :: FIFOF Tlp
+    wireInCpl :: FIFOF Tlp
+    -- Latches the runtime-tunable parameters this side needs. Call ONCE,
+    -- from the top level's init rule, right after it has read Config via
+    -- BDPI -- not a module parameter, because BDPI's result does not
+    -- exist yet at the point mkSide is elaborated. Until this is called,
+    -- nP/nNP are seeded to 0, which naturally keeps produceP/produceNP
+    -- (and everything downstream of them) from firing at all.
+    configure :: Cycle -> Cycle -> Cycle -> Cycle -> Cycle -> Cycle -> Bool -> Action
+    finished :: Bool
+    printReport :: Action
+
+-- Only structural parameters remain module parameters: they size FIFOs
+-- and feed the elaboration-time serialization-cycle calculation below,
+-- both decided once and for all at elaboration, long before any BDPI
+-- call could possibly run.
+mkSide :: Integer -> Integer -> Integer -> Integer -> Integer -> Integer -> Module Side
+mkSide sideId pWireBytes npWireBytes cplWireBytes bytesPerCycle linkLatI =
+  module
+    let pSerI   = (pWireBytes   + bytesPerCycle - 1) `div` bytesPerCycle
+    let npSerI  = (npWireBytes  + bytesPerCycle - 1) `div` bytesPerCycle
+    let cplSerI = (cplWireBytes + bytesPerCycle - 1) `div` bytesPerCycle
+
+    let pSer :: Cycle
+        pSer = fromInteger pSerI
+    let npSer :: Cycle
+        npSer = fromInteger npSerI
+    let cplSer :: Cycle
+        cplSer = fromInteger cplSerI
+    let linkLat :: Cycle
+        linkLat = fromInteger linkLatI
+
+    -- Runtime-tunable parameters: registers, not elaboration-time
+    -- constants, because configure() sets them after a BDPI read that can
+    -- only happen once simulation is already running. Seeded to 0/1/True
+    -- -- safe placeholders, since nP=nNP=0 alone already keeps everything
+    -- that depends on them from firing before configure() is called.
+    nP :: Reg Cycle
+    nP <- mkReg 0
+    nNP :: Reg Cycle
+    nNP <- mkReg 0
+    nInNP :: Reg Cycle
+    nInNP <- mkReg 0
+    pIntvl :: Reg Cycle
+    pIntvl <- mkReg 1
+    npIntvl :: Reg Cycle
+    npIntvl <- mkReg 1
+    readGap :: Reg Cycle
+    readGap <- mkReg 0
+    enforceReg :: Reg Bool
+    enforceReg <- mkReg True
+
+    cyc :: Reg Cycle
+    cyc <- mkReg 0
+
+    pQ :: FIFOF Tlp
+    pQ <- mkSizedFIFOF 32
+    npQ :: FIFOF Tlp
+    npQ <- mkSizedFIFOF 16
+    cplQ :: FIFOF Tlp
+    cplQ <- mkSizedFIFOF 16
+
+    pCr :: CreditPool
+    pCr <- mkCreditPool creditsPI
+    npCr :: CreditPool
+    npCr <- mkCreditPool creditsNPI
+    cplCr :: CreditPool
+    cplCr <- mkCreditPool creditsCplI
+
+    credRet :: FIFOF (TlpKind, Cycle)
+    credRet <- mkSizedFIFOF 16
+    outQ :: FIFOF Tlp
+    outQ <- mkSizedFIFOF 8
+    inQP :: FIFOF Tlp
+    inQP <- mkSizedFIFOF 8
+    inQNp :: FIFOF Tlp
+    inQNp <- mkSizedFIFOF 8
+    inQCpl :: FIFOF Tlp
+    inQCpl <- mkSizedFIFOF 8
+
+    pIssuedCount :: Reg Cycle
+    pIssuedCount <- mkReg 0
+    pSentCount :: Reg Cycle
+    pSentCount <- mkReg 0
+    otherPDelivered :: Reg Cycle
+    otherPDelivered <- mkReg 0
+
+    -- mem: data this side has actually received, indexed by address --
+    -- updated by recvP, read by recvNp when answering an incoming read.
+    mem :: Vector BufSize (Reg (Bit 32))
+    mem <- replicateM (mkReg 0)
+    dataViolations :: Reg Cycle
+    dataViolations <- mkReg 0
+
+    pMade :: Reg Cycle
+    pMade <- mkReg 0
+    pTimer :: Reg Cycle
+    pTimer <- mkReg 0
+    npMade :: Reg Cycle
+    npMade <- mkReg 0
+    npTimer :: Reg Cycle
+    npTimer <- mkReg 0
+    reqReceived :: Reg Cycle
+    reqReceived <- mkReg 0
+    cplReceived :: Reg Cycle
+    cplReceived <- mkReg 0
+
+    txBusy :: Reg Cycle
+    txBusy <- mkReg 0
+
+    pLatSum :: Reg (UInt 64)
+    pLatSum <- mkReg 0
+    pLatMax :: Reg Cycle
+    pLatMax <- mkReg 0
+    reqLatSum :: Reg (UInt 64)
+    reqLatSum <- mkReg 0
+    reqLatMax :: Reg Cycle
+    reqLatMax <- mkReg 0
+    cplLatSum :: Reg (UInt 64)
+    cplLatSum <- mkReg 0
+    cplLatMax :: Reg Cycle
+    cplLatMax <- mkReg 0
+    violations :: Reg Cycle
+    violations <- mkReg 0
+    npHeldCycles :: Reg Cycle
+    npHeldCycles <- mkReg 0
+    cplHeldCycles :: Reg Cycle
+    cplHeldCycles <- mkReg 0
+
+    rules
+      "produceP": when pMade < nP, pTimer == 0
+        ==> action
+              let thisSeq = pIssuedCount + 1
+              let addr :: Bit BufBits
+                  addr = truncate (pack thisSeq)
+              let d :: Bit 32
+                  d = pack thisSeq
+              pQ.enq (Tlp { kind = TPOSTED; depCount = 0; seqNum = thisSeq; addr = addr; dat = d; tCreate = cyc })
+              pIssuedCount := thisSeq
+              pMade := pMade + 1
+              pTimer := pIntvl - 1
+
+      "produceP_wait": when pTimer /= 0
+        ==> pTimer := pTimer - 1
+
+      -- A read targets the write issued READ_GAP writes ago -- read-after-
+      -- write by construction. targetSeq can legitimately be 0 (e.g. an
+      -- all-reads pattern with readGap=0 and no writes); 0 isn't a real
+      -- write's number, but the check asks for pack(0), which is exactly
+      -- mem's own reset value, so that case still checks out correctly.
+      "produceNP": when npMade < nNP, npTimer == 0, pIssuedCount >= readGap
+        ==> action
+              let targetSeq = pIssuedCount - readGap
+              let addr :: Bit BufBits
+                  addr = truncate (pack targetSeq)
+              npQ.enq (Tlp { kind = TNONPOSTED; depCount = pIssuedCount; seqNum = targetSeq; addr = addr; dat = 0; tCreate = cyc })
+              npMade := npMade + 1
+              npTimer := npIntvl - 1
+
+      "produceNP_wait": when npTimer /= 0
+        ==> npTimer := npTimer - 1
+
+      "txSendCpl": when txBusy == 0, cplCr.avail,
+                        not enforceReg || cplQ.first.depCount <= pSentCount
+        ==> action
+              let t = cplQ.first
+              cplQ.deq
+              outQ.enq t
+              txBusy := cplSer - 1
+              cplCr.take
+              credRet.enq (TCOMPLETION, cyc + cplSer + 2*linkLat)
+
+      "txSendNp": when txBusy == 0, npCr.avail,
+                       not enforceReg || npQ.first.depCount <= pSentCount
+        ==> action
+              let t = npQ.first
+              npQ.deq
+              outQ.enq t
+              txBusy := npSer - 1
+              npCr.take
+              credRet.enq (TNONPOSTED, cyc + npSer + 2*linkLat)
+
+      "txSendP": when txBusy == 0, pCr.avail
+        ==> action
+              let t = pQ.first
+              pQ.deq
+              outQ.enq t
+              txBusy := pSer - 1
+              pCr.take
+              pSentCount := pSentCount + 1
+              credRet.enq (TPOSTED, cyc + pSer + 2*linkLat)
+
+      "txWait": when txBusy /= 0
+        ==> txBusy := txBusy - 1
+
+      "statNpHeld": when enforceReg, npCr.avail, npQ.first.depCount > pSentCount
+        ==> npHeldCycles := npHeldCycles + 1
+
+      "statCplHeld": when enforceReg, cplCr.avail, cplQ.first.depCount > pSentCount
+        ==> cplHeldCycles := cplHeldCycles + 1
+
+      "creditArrive": when tpl_2 credRet.first <= cyc
+        ==> action
+              let e = credRet.first
+              credRet.deq
+              case tpl_1 e of
+                TPOSTED     -> pCr.give
+                TNONPOSTED  -> npCr.give
+                TCOMPLETION -> cplCr.give
+
+      "recvP": when True
+        ==> action
+              let t = inQP.first
+              inQP.deq
+              (select mem t.addr) := t.dat  -- the write actually lands, here, now
+              otherPDelivered := otherPDelivered + 1
+              pLatSum := pLatSum + zeroExtend (cyc - t.tCreate)
+              if cyc - t.tCreate > pLatMax
+               then pLatMax := cyc - t.tCreate
+               else noAction
+
+      -- An incoming read: generate a completion NOW, carrying our current
+      -- pIssuedCount (ordering check) and whatever is ACTUALLY sitting in
+      -- our memory at the requested address (data check). This can still
+      -- block if cplQ is full -- but now that only holds up OTHER incoming
+      -- reads, not incoming writes or completions too.
+      "recvNp": when True
+        ==> action
+              let t = inQNp.first
+              inQNp.deq
+              let found = (select mem t.addr)._read
+              cplQ.enq (Tlp { kind = TCOMPLETION; depCount = pIssuedCount;
+                              seqNum = t.seqNum; addr = t.addr; dat = found; tCreate = cyc })
+              reqReceived := reqReceived + 1
+              reqLatSum := reqLatSum + zeroExtend (cyc - t.tCreate)
+              if cyc - t.tCreate > reqLatMax
+               then reqLatMax := cyc - t.tCreate
+               else noAction
+
+      -- A completion answering one of our own reads: check BOTH guarantees.
+      "recvCpl": when True
+        ==> action
+              let t = inQCpl.first
+              inQCpl.deq
+              cplReceived := cplReceived + 1
+              cplLatSum := cplLatSum + zeroExtend (cyc - t.tCreate)
+              if cyc - t.tCreate > cplLatMax
+               then cplLatMax := cyc - t.tCreate
+               else noAction
+              -- Ordering check: did enough writes exist by generation time?
+              if otherPDelivered < t.depCount
+               then action
+                      violations := violations + 1
+                      $display "t=%0d  Side%0d ORDER VIOLATION: completion says %0d prior writes existed, but only %0d have been received" cyc sideId t.depCount otherPDelivered
+               else noAction
+              -- Data check: expected value is computed directly from the
+              -- sequence number this completion carries (pack t.seqNum) --
+              -- a fixed fact, never a lookup into state that may have
+              -- moved on by the time a slow completion arrives.
+              if t.dat /= pack t.seqNum
+               then action
+                      dataViolations := dataViolations + 1
+                      $display "t=%0d  Side%0d DATA VIOLATION: seqNum %0d (addr %0d) expected %0d, got %0d" cyc sideId t.seqNum t.addr (pack t.seqNum) t.dat
+               else noAction
+
+      {-# ASSERT fire when enabled #-}
+      {-# ASSERT no implicit conditions #-}
+      "tick": when True ==> cyc := cyc + 1
+
+    interface
+      wireOut   = outQ
+      wireInP   = inQP
+      wireInNp  = inQNp
+      wireInCpl = inQCpl
+      configure newNP newNNP newNInNP newPIntvl newNPIntvl newReadGap newEnforce =
+        action
+          nP         := newNP
+          nNP        := newNNP
+          nInNP      := newNInNP
+          pIntvl     := newPIntvl
+          npIntvl    := newNPIntvl
+          readGap    := newReadGap
+          enforceReg := newEnforce
+      finished = pMade == nP && npMade == nNP && cplReceived == nNP && reqReceived == nInNP
+                  && not pQ.notEmpty && not npQ.notEmpty && not cplQ.notEmpty
+                  && not outQ.notEmpty && not inQP.notEmpty && not inQNp.notEmpty && not inQCpl.notEmpty
+      printReport =
+        action
+          let pAvg   = if nP    == 0 then 0 else pLatSum   / zeroExtend nP
+          let reqAvg = if nInNP == 0 then 0 else reqLatSum / zeroExtend nInNP
+          let cplAvg = if nNP   == 0 then 0 else cplLatSum / zeroExtend nNP
+          $display "---- Side %0d ----" sideId
+          $display "  Posted sent=%0d  Reads sent=%0d  Reads answered=%0d  Completions recv'd=%0d" pMade npMade reqReceived cplReceived
+          $display "  incoming P avg/max latency   : %0d / %0d cycles" pAvg pLatMax
+          $display "  read-request avg/max latency : %0d / %0d cycles" reqAvg reqLatMax
+          $display "  completion avg/max latency   : %0d / %0d cycles" cplAvg cplLatMax
+          $display "  NP held by ordering : %0d   CPL held by ordering : %0d" npHeldCycles cplHeldCycles
+          $display "  ORDER VIOLATIONS: %0d   DATA VIOLATIONS: %0d" violations dataViolations
+
+          -- Observed throughput on THIS side's own outbound link, from what
+          -- it actually sent (pMade writes, npMade reads, reqReceived
+          -- completions -- by report time all three are fully drained, so
+          -- reqReceived IS the completion count actually sent).
+          let wireBytesSent :: UInt 64
+              wireBytesSent = zeroExtend pMade * fromInteger pWireBytes
+                            + zeroExtend npMade * fromInteger npWireBytes
+                            + zeroExtend reqReceived * fromInteger cplWireBytes
+          let payloadBytesSent :: UInt 64
+              payloadBytesSent = zeroExtend pMade * fromInteger pPayloadBytes
+          let clockU64 :: UInt 64
+              clockU64 = fromInteger clockRateMHz
+          let cycU64 :: UInt 64
+              cycU64 = zeroExtend cyc
+          let linkMbpsX100 :: UInt 64
+              linkMbpsX100 = if cycU64 == 0 then 0 else (wireBytesSent * 8 * clockU64 * 100) / cycU64
+          let payloadMbpsX100 :: UInt 64
+              payloadMbpsX100 = if cycU64 == 0 then 0 else (payloadBytesSent * 8 * clockU64 * 100) / cycU64
+          let theoreticalMbpsU64 :: UInt 64
+              theoreticalMbpsU64 = fromInteger theoreticalMbps
+          let utilX10 :: UInt 64
+              utilX10 = if theoreticalMbpsU64 == 0 then 0 else (linkMbpsX100 * 10) / theoreticalMbpsU64
+          -- %0Nd space-pads in BSV's/BH's $display, it does not zero-pad
+          -- (confirmed directly: %03d on 0 prints "  0", not "000").
+          -- Splitting a 2-digit fraction into two separate single-digit
+          -- %0d fields sidesteps the issue entirely -- each digit is
+          -- always exactly one character, so no padding is ever needed.
+          let linkInt :: UInt 64
+              linkInt = linkMbpsX100 / 100
+          let linkFrac :: UInt 64
+              linkFrac = linkMbpsX100 % 100
+          let linkFracTens :: UInt 64
+              linkFracTens = linkFrac / 10
+          let linkFracOnes :: UInt 64
+              linkFracOnes = linkFrac % 10
+          let utilInt :: UInt 64
+              utilInt = utilX10 / 10
+          let utilFrac :: UInt 64
+              utilFrac = utilX10 % 10
+          let payInt :: UInt 64
+              payInt = payloadMbpsX100 / 100
+          let payFrac :: UInt 64
+              payFrac = payloadMbpsX100 % 100
+          let payFracTens :: UInt 64
+              payFracTens = payFrac / 10
+          let payFracOnes :: UInt 64
+              payFracOnes = payFrac % 10
+          $display "  observed link throughput    : %0d.%0d%0d Mb/s  (%0d.%0d%% of theoretical, all TLP types)"
+                   linkInt linkFracTens linkFracOnes utilInt utilFrac
+          $display "  observed payload throughput : %0d.%0d%0d Mb/s  (Posted Writes only, useful data rate)"
+                   payInt payFracTens payFracOnes
+
+struct InFlight =
+    tlp     :: Tlp
+    tArrive :: Cycle
+ deriving (Bits, Eq)
+
+mkPcieModelOrdered :: Module Empty
+mkPcieModelOrdered =
+  module
+    -- Structural parameters only -- see mkSide's comment. Runtime-tunable
+    -- ones are latched below, after Config is read, via configure().
+    sideA :: Side
+    sideA <- mkSide 0 (pPayloadBytes + pOverheadBytes) npHeaderBytes
+                    (cplPayloadBytes + cplOverheadBytes) linkBytesPerCycle linkLatencyI
+    sideB :: Side
+    sideB <- mkSide 1 (pPayloadBytes + pOverheadBytes) npHeaderBytes
+                    (cplPayloadBytes + cplOverheadBytes) linkBytesPerCycle linkLatencyI
+
+    cfgReader :: ConfigReader
+    cfgReader <- mkConfigReader
+
+    cyc :: Reg Cycle
+    cyc <- mkReg 0
+
+    let linkLat :: Cycle
+        linkLat = fromInteger linkLatencyI
+
+    pipeAB :: FIFOF InFlight
+    pipeAB <- mkSizedFIFOF 8
+    pipeBA :: FIFOF InFlight
+    pipeBA <- mkSizedFIFOF 8
+
+    finished :: Reg Bool
+    finished <- mkReg False
+    configured :: Reg Bool
+    configured <- mkReg False
+    enforceFlag :: Reg Bool
+    enforceFlag <- mkReg True   -- only for the final report's own display
+
+    rules
+      {-# ASSERT fire when enabled #-}
+      {-# ASSERT no implicit conditions #-}
+      "tick": when True ==> cyc := cyc + 1
+
+      -- Runs exactly once, at cyc=0, before anything else below has
+      -- anything to do (nP=nNP=0 on both sides until this fires). One
+      -- BDPI call per field, via cfgReader.load; the loaded values then
+      -- get pushed into each side with its own configure() call, since
+      -- sideA and sideB each need DIFFERENT fields from the SAME Config
+      -- (sideA's expectIncomingNP is sideB's own read count, and vice
+      -- versa -- the cross-reference the original design always had).
+      "initConfig": when not configured
+        ==> action
+              configured := True
+              cfg <- cfgReader.load defaultConfig
+              enforceFlag := cfg.enforceOrdering
+              sideA.configure cfg.numPA cfg.numNPA cfg.numNPB
+                               cfg.prodPInterval cfg.prodNPInterval cfg.readGap cfg.enforceOrdering
+              sideB.configure cfg.numPB cfg.numNPB cfg.numNPA
+                               cfg.prodPInterval cfg.prodNPInterval cfg.readGap cfg.enforceOrdering
+
+      "sendAB": when True
+        ==> action
+              let t = sideA.wireOut.first
+              sideA.wireOut.deq
+              pipeAB.enq (InFlight { tlp = t; tArrive = cyc + linkLat })
+
+      "deliverAB": when pipeAB.first.tArrive <= cyc
+        ==> action
+              let t = pipeAB.first.tlp
+              pipeAB.deq
+              case t.kind of
+                TPOSTED     -> sideB.wireInP.enq t
+                TNONPOSTED  -> sideB.wireInNp.enq t
+                TCOMPLETION -> sideB.wireInCpl.enq t
+
+      "sendBA": when True
+        ==> action
+              let t = sideB.wireOut.first
+              sideB.wireOut.deq
+              pipeBA.enq (InFlight { tlp = t; tArrive = cyc + linkLat })
+
+      "deliverBA": when pipeBA.first.tArrive <= cyc
+        ==> action
+              let t = pipeBA.first.tlp
+              pipeBA.deq
+              case t.kind of
+                TPOSTED     -> sideA.wireInP.enq t
+                TNONPOSTED  -> sideA.wireInNp.enq t
+                TCOMPLETION -> sideA.wireInCpl.enq t
+
+      -- "configured" guards against a real edge case: at cyc=0, before
+      -- initConfig has run, nP=nNP=nInNP=0 on both sides AND every counter
+      -- is also 0, which makes Side's own `finished` vacuously True for
+      -- that one cycle. Without this guard "report" could fire instantly,
+      -- before any real configuration or production has happened.
+      "report": when sideA.finished, sideB.finished, not finished, configured
+        ==> action
+              finished := True
+              $display "==== Link assumptions ===="
+              $display "  %s x%0d lanes @ %0d MHz  ->  %0d bytes/cycle (effective, hand-derived -- see note above)"
+                       pcieGen numLanes clockRateMHz linkBytesPerCycle
+              $display "  theoretical link throughput: %0d Mb/s (%0d.%0d Gb/s)"
+                       theoreticalMbps (theoreticalMbps `div` 1000) ((theoreticalMbps `rem` 1000) `div` 100)
+              $display ""
+              $display "==== Bidirectional PCIe producer-consumer model ===="
+              $display "ENFORCE_ORDERING=%0d  total cycles=%0d" (pack enforceFlag) cyc
+              sideA.printReport
+              sideB.printReport
+              $finish 0
+

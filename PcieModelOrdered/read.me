@@ -1,0 +1,42 @@
+Example: PcieModelOrdered
+This example in .bsv and .bs models PCIe producer consumer rules to
+model throughput and latency performance. All the run-time parameters
+can be passed as environment variables. 
+----------------------------------------------------------------------
+
+Build and run instructions:
+git clone https://github.com/suhaspai/bsv_and_bs_examples.git
+cd bsv_and_bs_examples
+
+# Separately source your bluespec (bsc) environment
+source env64.csh   # sets up alised command "chex"
+check: alias chex  # to see what it does
+
+chex PcieModelOrdered   # Pick PcieModelOrdered example and cd into it
+
+To create bluesim target (defined in ../bsv.mk)
+make synth_bluesim
+
+To run default bluesim target (defined in ../bsv.mk)
+make bsim_run  # 10% reads 
+make run_sim   # same as above
+
+To do both (defined in ../bsv.mk)
+make bluesim
+
+Run write after write  (defined in ./makefile which includes ../bsv.mk)
+make waw    # pipelined posted writes, the run is analyzed in analysis.txt
+make rar    # pipelined nonposted reads
+make raw    # pipelined read after write
+
+The code adheres to all PCIe producer consumering ordering rules (you can prove them! :)
+Please let me know if you see any errors.
+
+The classic bluespec version (.bs) is also available which can be compiled using
+the following command:
+
+make TARGET=bs synth_bluesim   (the TARGET is set to bsv)
+
+Credit: This code was developed using Claud.AI assistant through series for prompts.
+https://claude.ai/share/a251cdf2-2ed5-43ae-9617-88e43adac4c7
+
